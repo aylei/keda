@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/oauth2/clientcredentials"
 	v2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/metrics/pkg/apis/external_metrics"
@@ -95,7 +97,8 @@ type pulsarStats struct {
 
 // NewPulsarScaler creates a new PulsarScaler
 func NewPulsarScaler(config *ScalerConfig) (Scaler, error) {
-	pulsarMetadata, err := parsePulsarMetadata(config)
+	logger := InitializeLogger(config, "pulsar_scaler")
+	pulsarMetadata, err := parsePulsarMetadata(config, logger)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing pulsar metadata: %w", err)
 	}
@@ -125,11 +128,11 @@ func NewPulsarScaler(config *ScalerConfig) (Scaler, error) {
 	return &pulsarScaler{
 		client:   client,
 		metadata: pulsarMetadata,
-		logger:   InitializeLogger(config, "pulsar_scaler"),
+		logger:   logger,
 	}, nil
 }
 
-func parsePulsarMetadata(config *ScalerConfig) (pulsarMetadata, error) {
+func parsePulsarMetadata(config *ScalerConfig, logger logr.Logger) (pulsarMetadata, error) {
 	meta := pulsarMetadata{}
 	switch {
 	case config.TriggerMetadata["adminURLFromEnv"] != "":
@@ -178,13 +181,24 @@ func parsePulsarMetadata(config *ScalerConfig) (pulsarMetadata, error) {
 
 	meta.msgBacklogThreshold = defaultMsgBacklogThreshold
 
+	// FIXME: msgBacklog support DEPRECATED to be removed in v2.14
+	fmt.Println(config.TriggerMetadata)
 	if val, ok := config.TriggerMetadata[msgBacklogMetricName]; ok {
+		logger.V(1).Info("\"msgBacklog\" is deprecated and will be removed in v2.14, please use \"msgBacklogThreshold\" instead")
+		t, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			return meta, fmt.Errorf("error parsing %s: %w", msgBacklogMetricName, err)
+		}
+		meta.msgBacklogThreshold = t
+	} else if val, ok := config.TriggerMetadata["msgBacklogThreshold"]; ok {
 		t, err := strconv.ParseInt(val, 10, 64)
 		if err != nil {
 			return meta, fmt.Errorf("error parsing %s: %w", msgBacklogMetricName, err)
 		}
 		meta.msgBacklogThreshold = t
 	}
+	// END FIXME
+
 	// For backwards compatibility, we need to map "tls: enable" to
 	if tls, ok := config.TriggerMetadata["tls"]; ok {
 		if tls == enable && (config.AuthParams["cert"] != "" || config.AuthParams["key"] != "") {
@@ -199,6 +213,23 @@ func parsePulsarMetadata(config *ScalerConfig) (pulsarMetadata, error) {
 	if err != nil {
 		return meta, fmt.Errorf("error parsing %s: %w", msgBacklogMetricName, err)
 	}
+
+	if auth != nil && auth.EnableOAuth {
+		if auth.OauthTokenURI == "" {
+			auth.OauthTokenURI = config.TriggerMetadata["oauthTokenURI"]
+		}
+		if auth.Scopes == nil {
+			auth.Scopes = authentication.ParseScope(config.TriggerMetadata["scope"])
+		}
+		if auth.ClientID == "" {
+			auth.ClientID = config.TriggerMetadata["clientID"]
+		}
+		// client_secret is not required for mtls OAuth(RFC8705)
+		// set secret to random string to work around the Go OAuth lib
+		if auth.ClientSecret == "" {
+			auth.ClientSecret = time.Now().String()
+		}
+	}
 	meta.pulsarAuth = auth
 	meta.scalerIndex = config.ScalerIndex
 	return meta, nil
@@ -212,9 +243,19 @@ func (s *pulsarScaler) GetStats(ctx context.Context) (*pulsarStats, error) {
 		return nil, fmt.Errorf("error requesting stats from admin url: %w", err)
 	}
 
+	client := s.client
+	if s.metadata.pulsarAuth.EnableOAuth {
+		config := clientcredentials.Config{
+			ClientID:     s.metadata.pulsarAuth.ClientID,
+			ClientSecret: s.metadata.pulsarAuth.ClientSecret,
+			TokenURL:     s.metadata.pulsarAuth.OauthTokenURI,
+			Scopes:       s.metadata.pulsarAuth.Scopes,
+		}
+		client = config.Client(context.Background())
+	}
 	addAuthHeaders(req, &s.metadata)
 
-	res, err := s.client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("error requesting stats from admin url: %w", err)
 	}

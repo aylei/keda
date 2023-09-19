@@ -29,20 +29,16 @@ import (
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/metricsservice"
-	"github.com/kedacore/keda/v2/pkg/scaling"
 )
 
 // KedaProvider implements External Metrics Provider
 type KedaProvider struct {
 	defaults.DefaultExternalMetricsProvider
 
-	client           client.Client
-	scaleHandler     scaling.ScaleHandler
-	watchedNamespace string
-	ctx              context.Context
+	client client.Client
+	ctx    context.Context
 
-	grpcClient            metricsservice.GrpcClient
-	useMetricsServiceGrpc bool
+	grpcClient metricsservice.GrpcClient
 }
 
 var (
@@ -52,14 +48,11 @@ var (
 )
 
 // NewProvider returns an instance of KedaProvider
-func NewProvider(ctx context.Context, adapterLogger logr.Logger, scaleHandler scaling.ScaleHandler, client client.Client, grpcClient metricsservice.GrpcClient, useMetricsServiceGrpc bool, watchedNamespace string) provider.ExternalMetricsProvider {
+func NewProvider(ctx context.Context, adapterLogger logr.Logger, client client.Client, grpcClient metricsservice.GrpcClient) provider.ExternalMetricsProvider {
 	provider := &KedaProvider{
-		client:                client,
-		scaleHandler:          scaleHandler,
-		watchedNamespace:      watchedNamespace,
-		ctx:                   ctx,
-		grpcClient:            grpcClient,
-		useMetricsServiceGrpc: useMetricsServiceGrpc,
+		client:     client,
+		ctx:        ctx,
+		grpcClient: grpcClient,
 	}
 	logger = adapterLogger.WithName("provider")
 	logger.Info("starting")
