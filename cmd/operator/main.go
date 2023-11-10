@@ -18,6 +18,7 @@ package main
 
 import (
 	"flag"
+	"github.com/kedacore/keda/v2/pkg/activate"
 	"os"
 	"time"
 
@@ -231,6 +232,11 @@ func main() {
 		EventRecorder: eventRecorder,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ClusterTriggerAuthentication")
+		os.Exit(1)
+	}
+	if err = activate.New(activate.DefaultRegistry).SetupWithManager(mgr); err != nil {
+
+		setupLog.Error(err, "unable to create activation controller", "controller", "ActivationController")
 		os.Exit(1)
 	}
 	//+kubebuilder:scaffold:builder

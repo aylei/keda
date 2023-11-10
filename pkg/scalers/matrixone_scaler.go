@@ -3,19 +3,30 @@ package scalers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/go-logr/logr"
 	"github.com/go-sql-driver/mysql"
+	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	"github.com/kedacore/keda/v2/pkg/activate"
 	v2 "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 	"net"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"strconv"
 	"time"
 )
 
 const (
-	// cnset load score is the load score calculated for the CNSet, normalized by 1
-	cnLoadScore = "cnset_load_score"
+	// cnCPU is the total CPU usage of the CNSet
+	cnCPU = "min_cpu"
+
+	// cnConnections is the total connection count of the CNSet
+	cnConnections = "connections"
+
+	// connections from pod, use this metric before cnConnections get stable
+	cnConnectionsFromPod = "connections_from_pod"
 
 	dbName = "system_metrics"
 )
@@ -25,44 +36,62 @@ type matrixoneScaler struct {
 	metadata   *matrixoneMetadata
 	connection *sql.DB
 	logger     logr.Logger
+	kubeCli    client.Client
+
+	cfg *ScalerConfig
 }
 
 type matrixoneMetadata struct {
 	username    string
-	password    string
 	host        string
 	port        string
+	password    string
+	accountId   string
+	metric      string
 	targetValue float64
-	window      time.Duration
+
+	cnSetKey string
+
+	window time.Duration
 }
 
 // NewMatrixoneScaler creates a new MatrixOne scaler
-func NewMatrixoneScaler(config *ScalerConfig) (Scaler, error) {
-	metricType, err := GetMetricTargetType(config)
-	if err != nil {
-		return nil, fmt.Errorf("error getting scaler metric type: %w", err)
-	}
-
+func NewMatrixoneScaler(kubeCli client.Client, config *ScalerConfig) (Scaler, error) {
 	logger := InitializeLogger(config, "mo_scaler")
 
-	meta, err := parseMatrixoneMetadata(config)
+	meta, err := parseMatrixoneMetadata(kubeCli, config)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing MySQL metadata: %w", err)
+		return nil, fmt.Errorf("error parsing MatrixOne metadata: %w", err)
+	}
+
+	metricType := v2.AverageValueMetricType
+	if metric, ok := config.TriggerMetadata["metric"]; ok {
+		switch metric {
+		case cnCPU, cnConnections, cnConnectionsFromPod:
+			metricType = v2.AverageValueMetricType
+		default:
+			return nil, fmt.Errorf("metric %s is not supported", metric)
+		}
+		meta.metric = metric
+	} else {
+		return nil, fmt.Errorf("no metric given")
 	}
 
 	conn, err := newMOConnection(meta, logger)
 	if err != nil {
-		return nil, fmt.Errorf("error establishing MySQL connection: %w", err)
+		return nil, fmt.Errorf("error establishing MO connection: %w", err)
 	}
 	return &matrixoneScaler{
+		kubeCli:    kubeCli,
 		metricType: metricType,
 		metadata:   meta,
 		connection: conn,
 		logger:     logger,
+		cfg:        config,
 	}, nil
 }
 
-func parseMatrixoneMetadata(config *ScalerConfig) (*matrixoneMetadata, error) {
+func parseMatrixoneMetadata(kubeCli client.Client, config *ScalerConfig) (*matrixoneMetadata, error) {
 	meta := matrixoneMetadata{}
 
 	if val, ok := config.TriggerMetadata["targetValue"]; ok {
@@ -74,6 +103,7 @@ func parseMatrixoneMetadata(config *ScalerConfig) (*matrixoneMetadata, error) {
 	} else {
 		return nil, fmt.Errorf("no targetValue given")
 	}
+	meta.accountId = config.TriggerMetadata["accountId"]
 
 	var err error
 	host, err := GetFromAuthOrMeta(config, "host")
@@ -88,21 +118,30 @@ func parseMatrixoneMetadata(config *ScalerConfig) (*matrixoneMetadata, error) {
 	}
 	meta.port = port
 
-	username, err := GetFromAuthOrMeta(config, "username")
+	secretNs, err := GetFromAuthOrMeta(config, "secretNamespace")
+	if err != nil {
+		secretNs = config.ScalableObjectNamespace
+	}
+	secret, err := GetFromAuthOrMeta(config, "secretName")
 	if err != nil {
 		return nil, err
 	}
-	meta.username = username
-
-	if config.AuthParams["password"] != "" {
-		meta.password = config.AuthParams["password"]
-	} else if config.TriggerMetadata["passwordFromEnv"] != "" {
-		meta.password = config.ResolvedEnv[config.TriggerMetadata["passwordFromEnv"]]
+	sec := &corev1.Secret{}
+	err = kubeCli.Get(context.Background(), client.ObjectKey{Namespace: secretNs, Name: secret}, sec)
+	if err != nil {
+		return nil, err
 	}
-
-	if len(meta.password) == 0 {
-		return nil, fmt.Errorf("no password given")
+	pwd, ok := sec.Data["password"]
+	if !ok {
+		return nil, errors.New("MO secret does not have password encoded")
 	}
+	meta.password = string(pwd)
+	usn, ok := sec.Data["username"]
+	if !ok {
+		return nil, errors.New("MO secret does not have username encoded")
+	}
+	meta.username = string(usn)
+	meta.window = 2 * time.Minute
 
 	return &meta, nil
 }
@@ -119,7 +158,7 @@ func (meta *matrixoneMetadata) toConnectionStr() string {
 	return config.FormatDSN()
 }
 
-// newMOConnection creates MySQL db connection
+// newMOConnection creates MO db connection
 func newMOConnection(meta *matrixoneMetadata, logger logr.Logger) (*sql.DB, error) {
 	connStr := meta.toConnectionStr()
 	db, err := sql.Open("mysql", connStr)
@@ -135,7 +174,7 @@ func newMOConnection(meta *matrixoneMetadata, logger logr.Logger) (*sql.DB, erro
 	return db, nil
 }
 
-// Close disposes of MySQL connections
+// Close disposes of MO connections
 func (s *matrixoneScaler) Close(context.Context) error {
 	err := s.connection.Close()
 	if err != nil {
@@ -149,7 +188,7 @@ func (s *matrixoneScaler) Close(context.Context) error {
 func (s *matrixoneScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSpec {
 	externalMetric := &v2.ExternalMetricSource{
 		Metric: v2.MetricIdentifier{
-			Name: cnLoadScore,
+			Name: s.metadata.metric,
 		},
 		Target: GetMetricTargetMili(s.metricType, s.metadata.targetValue),
 	}
@@ -161,24 +200,99 @@ func (s *matrixoneScaler) GetMetricSpecForScaling(context.Context) []v2.MetricSp
 
 // GetMetricsAndActivity returns value for a supported metric and an error if there is a problem getting the metric
 func (s *matrixoneScaler) GetMetricsAndActivity(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
-	switch metricName {
-	case cnLoadScore:
-		return s.getCNLoadScore(ctx)
+	switch s.metadata.metric {
+	case cnCPU:
+		return s.getCPU(ctx, metricName)
+	case cnConnections:
+		return s.getConnections(ctx, metricName)
+	case cnConnectionsFromPod:
+		return s.getConnectionsFromPod(ctx, metricName)
 	default:
-		return nil, false, fmt.Errorf("metric %s not supported", cnLoadScore)
+		return nil, false, fmt.Errorf("metric %s is not supported", s.metadata.metric)
 	}
 }
 
-func (s *matrixoneScaler) getCNLoadScore(ctx context.Context) ([]external_metrics.ExternalMetricValue, bool, error) {
+func (s *matrixoneScaler) Run(ctx context.Context, active chan<- bool) {
+	activate.DefaultRegistry.Regist(v1alpha1.GenerateIdentifier(s.cfg.ScalableObjectType, s.cfg.ScalableObjectNamespace, s.cfg.ScalableObjectName), active)
+}
+
+func (s *matrixoneScaler) getConnectionsFromPod(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
+	podList := &corev1.PodList{}
+	err := s.kubeCli.List(ctx, podList, client.InNamespace(s.cfg.ScalableObjectNamespace), client.MatchingLabels(map[string]string{
+		"matrixorigin.io/component": "CNSet",
+		"matrixorigin.io/instance":  s.cfg.ScalableObjectName,
+	}))
+	if err != nil {
+		return nil, false, err
+	}
+	var total int
+	for _, pod := range podList.Items {
+		c, ok := pod.Annotations["matrixorigin.io/connections"]
+		if !ok {
+			// dummy count
+			total += 1
+			continue
+		}
+		count, err := strconv.Atoi(c)
+		if err != nil {
+			total += 1
+			continue
+		}
+		total += count
+	}
+	var isActive bool
+	if total > 0 {
+		isActive = true
+	}
+	return []external_metrics.ExternalMetricValue{GenerateMetricInMili(metricName, float64(total))}, isActive, nil
+}
+
+func (s *matrixoneScaler) getConnections(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
+	timeStart := time.Now().Add(-s.metadata.window)
+	query := fmt.Sprintf(`
+SELECT max(value), node
+FROM system_metrics.server_connections 
+WHERE collecttime >= '%s'
+`, timeStart.Format("2006-01-02 15:04:05"))
+	if s.metadata.accountId != "" {
+		query += fmt.Sprintf("\nAND account='%s'", s.metadata.accountId)
+	}
+	query += "\nGROUP BY node"
+	rows, err := s.connection.QueryContext(ctx, query)
+	if err != nil {
+		return []external_metrics.ExternalMetricValue{}, false, fmt.Errorf("error query MO: %w", err)
+	}
+	defer rows.Close()
+	var total int
+	for rows.Next() {
+		var v int
+		var node string
+		if err := rows.Scan(&v, &node); err != nil {
+			return nil, false, err
+		}
+		total += v
+	}
+	isActive := false
+	if total > 0 {
+		isActive = true
+	}
+	return []external_metrics.ExternalMetricValue{GenerateMetricInMili(metricName, float64(total))}, isActive, nil
+}
+
+func (s *matrixoneScaler) getCPU(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 
 	timeStart := time.Now().Add(-s.metadata.window)
-	// TODO: integrate with CNSet node ranges
-	rows, err := s.connection.QueryContext(ctx, `
+	query := fmt.Sprintf(`
 SELECT node, (max(value) - min(value)) / ((max(collecttime) - min(collecttime)) + 0.001) as usage
 FROM process_cpu_seconds_total
 WHERE role="CN"
-AND collecttime >= ?
+AND collecttime >= '%s'
 `, timeStart)
+	if s.metadata.accountId != "" {
+		query += fmt.Sprintf("\nAND account='%s'", s.metadata.accountId)
+	}
+	query += "\nGROUP BY node"
+	rows, err := s.connection.QueryContext(ctx, query)
 	if err != nil {
 		return []external_metrics.ExternalMetricValue{}, false, fmt.Errorf("error query MO: %w", err)
 	}
@@ -198,7 +312,9 @@ AND collecttime >= ?
 	if count > 0 {
 		num = total / float64(count)
 	}
-	metric := GenerateMetricInMili(cnLoadScore, num)
+	metric := GenerateMetricInMili(metricName, num)
+	// we cannot scale to zero based on CPU metric so this trigger should always be active
+	isActive := true
 
-	return []external_metrics.ExternalMetricValue{metric}, true, nil
+	return []external_metrics.ExternalMetricValue{metric}, isActive, nil
 }

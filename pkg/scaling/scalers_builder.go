@@ -235,7 +235,7 @@ func buildScaler(ctx context.Context, client client.Client, triggerType string, 
 	case "stan":
 		return scalers.NewStanScaler(config)
 	case "matrixone":
-		return scalers.NewMatrixoneScaler(config)
+		return scalers.NewMatrixoneScaler(client, config)
 	default:
 		return nil, fmt.Errorf("no scaler found for type: %s", triggerType)
 	}
