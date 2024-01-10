@@ -11,6 +11,7 @@ import (
 	"github.com/kedacore/keda/v2/pkg/activate"
 	v2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 	"net"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,6 +50,7 @@ type matrixoneMetadata struct {
 	accountId   string
 	metric      string
 	targetValue float64
+	selector    string
 
 	cnSetKey string
 
@@ -104,6 +106,7 @@ func parseMatrixoneMetadata(kubeCli client.Client, config *ScalerConfig) (*matri
 		return nil, fmt.Errorf("no targetValue given")
 	}
 	meta.accountId = config.TriggerMetadata["accountId"]
+	meta.selector = config.TriggerMetadata["selector"]
 
 	var err error
 	host, err := GetFromAuthOrMeta(config, "host")
@@ -218,13 +221,32 @@ func (s *matrixoneScaler) Run(ctx context.Context, active chan<- bool) {
 
 func (s *matrixoneScaler) getConnectionsFromPod(ctx context.Context, metricName string) ([]external_metrics.ExternalMetricValue, bool, error) {
 	podList := &corev1.PodList{}
-	err := s.kubeCli.List(ctx, podList, client.InNamespace(s.cfg.ScalableObjectNamespace), client.MatchingLabels(map[string]string{
-		"matrixorigin.io/component": "CNSet",
-		"matrixorigin.io/instance":  s.cfg.ScalableObjectName,
-	}))
-	if err != nil {
-		return nil, false, err
+	if s.metadata.selector == "" {
+		// legacy logic
+		err := s.kubeCli.List(ctx, podList, client.InNamespace(s.cfg.ScalableObjectNamespace), client.MatchingLabels(map[string]string{
+			"matrixorigin.io/component": "CNSet",
+			"matrixorigin.io/instance":  s.cfg.ScalableObjectName,
+		}))
+		if err != nil {
+			return nil, false, err
+		}
+	} else {
+		ls, err := metav1.ParseToLabelSelector(s.metadata.selector)
+		if err != nil {
+			return nil, false, err
+		}
+		selector, err := metav1.LabelSelectorAsSelector(ls)
+		if err != nil {
+			return nil, false, err
+		}
+		err = s.kubeCli.List(ctx, podList, client.InNamespace(s.cfg.ScalableObjectNamespace), client.MatchingLabelsSelector{
+			Selector: selector,
+		})
+		if err != nil {
+			return nil, false, err
+		}
 	}
+
 	var total int
 	for _, pod := range podList.Items {
 		c, ok := pod.Annotations["matrixorigin.io/connections"]
