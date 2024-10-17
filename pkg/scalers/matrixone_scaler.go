@@ -185,10 +185,12 @@ func newMOConnection(meta *matrixoneMetadata, logger logr.Logger) (*sql.DB, erro
 
 // Close disposes of MO connections
 func (s *matrixoneScaler) Close(context.Context) error {
-	err := s.connection.Close()
-	if err != nil {
-		s.logger.Error(err, "Error closing MO connection")
-		return err
+	if s.connection != nil {
+		err := s.connection.Close()
+		if err != nil {
+			s.logger.Error(err, "Error closing MO connection")
+			return err
+		}
 	}
 	return nil
 }
