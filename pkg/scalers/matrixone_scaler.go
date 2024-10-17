@@ -5,6 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
+	"time"
+
 	"github.com/go-logr/logr"
 	"github.com/go-sql-driver/mysql"
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
@@ -13,10 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/metrics/pkg/apis/external_metrics"
-	"net"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"strconv"
-	"time"
 )
 
 const (
@@ -67,7 +68,8 @@ func NewMatrixoneScaler(kubeCli client.Client, config *ScalerConfig) (Scaler, er
 	}
 
 	metricType := v2.AverageValueMetricType
-	if metric, ok := config.TriggerMetadata["metric"]; ok {
+	metric, ok := config.TriggerMetadata["metric"]
+	if ok {
 		switch metric {
 		case cnCPU, cnConnections, cnConnectionsFromPod:
 			metricType = v2.AverageValueMetricType
@@ -79,18 +81,22 @@ func NewMatrixoneScaler(kubeCli client.Client, config *ScalerConfig) (Scaler, er
 		return nil, fmt.Errorf("no metric given")
 	}
 
-	conn, err := newMOConnection(meta, logger)
-	if err != nil {
-		return nil, fmt.Errorf("error establishing MO connection: %w", err)
-	}
-	return &matrixoneScaler{
+	ms := &matrixoneScaler{
 		kubeCli:    kubeCli,
 		metricType: metricType,
 		metadata:   meta,
-		connection: conn,
 		logger:     logger,
 		cfg:        config,
-	}, nil
+	}
+	// TODO: only initiate connection when getting metrics and handle failed scenario
+	if metric == cnConnections || metric == cnCPU {
+		conn, err := newMOConnection(meta, logger)
+		if err != nil {
+			return nil, fmt.Errorf("error establishing MO connection: %w", err)
+		}
+		ms.connection = conn
+	}
+	return ms, nil
 }
 
 func parseMatrixoneMetadata(kubeCli client.Client, config *ScalerConfig) (*matrixoneMetadata, error) {
